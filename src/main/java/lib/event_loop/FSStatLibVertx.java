@@ -1,155 +1,89 @@
 package lib.event_loop;
 
-import io.vertx.core.*;
+import io.vertx.core.Future;
+import io.vertx.core.Vertx;
 import io.vertx.core.file.FileSystem;
 import lib.FSReport;
-import lib.FSStatLib;
-import lib.FSStats;
-import lib.FSUpdateListener;
 
+import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.List;
 
-public class FSStatLibVertx implements FSStatLib {
-    private final int THROTTLE_SIZE = 300;
-    private Vertx vertx =  Vertx.vertx();
-    private FSUpdateListener listener;
-    private Path dir;
-    private long maxFS;
-    private int nb;
-    private long bandSize;
+/**
+ * FSStatLib - event-loop version (Vert.x).
+ *
+ * getFSReport is an asynchronous method returning a Vert.x Future.
+ * It is meant to be called from inside an event loop (e.g. a verticle):
+ * every continuation (compose / map / otherwise) is then executed by that
+ * same event-loop thread, so no state is ever shared among threads.
+ *
+ * The recursion is a non-blocking map-reduce built by composing futures:
+ *  - map:    every entry of a directory becomes a Future<FSReport>
+ *            (a file -> a report with one file, a sub-directory -> recursion)
+ *  - reduce: Future.all(...) joins the children and their reports are merged.
+ * Termination detection is therefore implicit: the future of a directory
+ * completes exactly when the futures of all its entries have completed.
+ *
+ * Symbolic links are not followed (as in the other versions). Since Vert.x
+ * readDir returns canonical paths (links already resolved), a link shows up
+ * as a path that is not a direct child of the directory, or as a duplicate:
+ * such entries are discarded, which also rules out cycles.
+ */
+public class FSStatLibVertx {
 
-    private FSStats stats;
+    private final Vertx vertx;
+    private final FileSystem fs;
 
-    private final AtomicBoolean isCompleted = new AtomicBoolean(false);
-    private final AtomicInteger activeTasks = new AtomicInteger(0);
-
-
-    @Override
-    public void getFSReport(Path dir, long maxFS, int nb, FSUpdateListener listener) {
-
-        this.listener = listener;
-        this.nb = nb;
-        this.maxFS = maxFS;
-        this.bandSize = maxFS / nb;
-
-        this.isCompleted.set(false);
-        this.activeTasks.set(0);
-
-        this.stats = new FSStats(nb);
-
-        scanDirectory(dir);
+    public FSStatLibVertx(Vertx vertx) {
+        this.vertx = vertx;
+        this.fs = vertx.fileSystem();
     }
 
-    @Override
-    public FSReport getCurrentReport() {
-        return stats != null ? stats.snapshot() : new FSReport(0, new long[nb + 1]);
-    }
-
-    @Override
-    public void stop() {
-        isCompleted.set(true);
-    }
-
-    private void scanDirectory(Path dir) {
-        if (isCompleted.get()) {
-            return;
+    public Future<FSReport> getFSReport(String dir, long maxFS, int nb) {
+        final FSReport empty;
+        try {
+            empty = FSReport.empty(maxFS, nb);
+        } catch (IllegalArgumentException ex) {
+            return Future.failedFuture(ex);
         }
+        // canonical path of the root: a short blocking call, offloaded to a worker
+        return vertx.executeBlocking(() -> Path.of(dir).toRealPath().toString())
+                .compose(root -> fs.lprops(root).compose(props -> props.isDirectory()
+                        ? scanDir(root, empty)
+                        : Future.failedFuture(new NotDirectoryException(dir))));
+    }
 
-        activeTasks.incrementAndGet();
-
-        FileSystem fs = vertx.fileSystem();
-        fs.readDir(String.valueOf(dir)).onComplete(res -> {
-            try {
-
-                if (isCompleted.get()) {
-                        return;
+    private Future<FSReport> scanDir(String dir, FSReport empty) {
+        return fs.readDir(dir).compose(entries -> {
+            List<Future<FSReport>> children = entries.stream()
+                    .distinct()
+                    .filter(entry -> isChildOf(entry, dir))   // drops resolved symbolic links
+                    .map(entry -> scanEntry(entry, empty))
+                    .toList();
+            return Future.all(children).map(all -> {
+                FSReport report = empty;
+                for (FSReport child : all.<FSReport>list()) {
+                    report = report.merge(child);
                 }
-
-                if (res.succeeded()) {
-                    for (final String entry : res.result()) {
-                        if (isCompleted.get()) {
-                            return;
-                        }
-
-                        activeTasks.incrementAndGet();
-
-                        fs.props(entry).onComplete(props -> {
-                            try {
-                                if (isCompleted.get()) {
-                                    return;
-                                }
-
-                                if (props.succeeded()) {
-
-                                    if (props.result().isDirectory()) {
-                                        scanDirectory(Path.of(entry));
-                                    } else {
-                                        processFile(Path.of(entry));
-                                    }
-                                }
-                            } finally {
-                                if (activeTasks.decrementAndGet() == 0) {
-                                    complete();
-                                }
-                            }
-
-                        });
-                    }
-                }
-            } finally {
-                if (activeTasks.decrementAndGet() == 0) {
-                    complete();
-                }
-            }
-
+                return report;
+            });
         });
     }
 
-    private void processFile(Path path) {
-        if (isCompleted.get()) {return;}
-
-        FileSystem fs = vertx.fileSystem();
-
-        activeTasks.incrementAndGet();
-
-        fs.props(path.toString()).onComplete(res -> {
-            try {
-                if (isCompleted.get()) {return;}
-
-                if (res.succeeded()) {
-                    final long fileSize = res.result().size();
-                    final int band = computeBand(fileSize);
-
-                    stats.addFile(band);
-                }
-            } finally {
-                if (activeTasks.decrementAndGet() == 0) {
-                    complete();
-                }
+    private Future<FSReport> scanEntry(String path, FSReport empty) {
+        return fs.lprops(path).compose(props -> {
+            if (props.isDirectory()) {
+                return scanDir(path, empty);
+            } else if (props.isRegularFile()) {
+                return Future.succeededFuture(empty.addFile(props.size()));
+            } else {
+                return Future.succeededFuture(empty);   // sockets, devices: ignored
             }
-        });
+        }).otherwise(empty);   // unreadable entry / sub-directory: it counts nothing
     }
 
-    private int computeBand(long fileSize) {
-        int band = (int) (fileSize / bandSize);
-
-        if (band >= nb)
-            band = nb;
-
-        return band;
-    }
-
-    private void complete() {
-        if (!isCompleted.getAndSet(true)) {
-            try {
-                listener.onComplete(stats.snapshot());
-            } finally {
-                if (vertx != null) {
-                    vertx.close();
-                }
-            }
-        }
+    static boolean isChildOf(String entry, String dir) {
+        Path parent = Path.of(entry).getParent();
+        return parent != null && parent.toString().equals(dir);
     }
 }

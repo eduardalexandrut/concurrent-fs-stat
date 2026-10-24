@@ -1,109 +1,83 @@
 package lib.virtual_threads;
 
 import lib.FSReport;
-import lib.FSStatLib;
-import lib.FSStats;
-import lib.FSUpdateListener;
 
-import java.io.File;
 import java.io.IOException;
+import java.nio.file.DirectoryIteratorException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.StreamSupport;
+import java.util.concurrent.FutureTask;
 
-public class FSStatLibVT implements FSStatLib {
-    private ExecutorService executor;
-    private FSUpdateListener listener;
-    private FSStats globalStats;
-    private long bandSize;
-    private int nb;
-    private final AtomicBoolean isCompleted = new AtomicBoolean(false);
+/**
+ * FSStatLib - virtual threads version.
+ *
+ * The code is plain, blocking, sequential Java: concurrency comes from
+ * forking one virtual thread per sub-directory and joining it (Future.get),
+ * which is cheap because a blocked virtual thread releases its carrier.
+ *
+ * Each virtual thread counts the files of its own directory in a local
+ * array and returns an immutable FSReport: results flow back through the
+ * futures (fork/join), so this version shares no mutable state at all.
+ */
+public class FSStatLibVT {
 
-    @Override
-    public void getFSReport(Path dir, long maxFS, int nb, FSUpdateListener listener) {
-        this.listener = listener;
-        this.nb = nb;
-        this.bandSize = maxFS / nb;
-        this.isCompleted.set(false);
-        this.globalStats = new FSStats(nb);
-        this.executor = Executors.newVirtualThreadPerTaskExecutor();
+    /** Asynchronous version: the report is computed by a new virtual thread. */
+    public Future<FSReport> getFSReport(Path dir, long maxFS, int nb) {
+        FutureTask<FSReport> task = new FutureTask<>(() -> computeFSReport(dir, maxFS, nb));
+        Thread.ofVirtual().name("fsstat-" + dir.getFileName()).start(task);
+        return task;
+    }
 
-        executor.submit(() -> {
-            try {
+    /** Synchronous version: blocks the caller until the report is ready. */
+    public FSReport computeFSReport(Path dir, long maxFS, int nb) throws Exception {
+        FSReport.checkParams(maxFS, nb);
+        if (!Files.isDirectory(dir)) {
+            throw new NotDirectoryException(dir.toString());
+        }
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            return scan(dir, maxFS, nb, executor);
+        }
+    }
+
+    private FSReport scan(Path dir, long maxFS, int nb, ExecutorService executor) throws Exception {
+        long[] bands = new long[nb + 1];                     // local to this virtual thread
+        List<Future<FSReport>> subDirs = new ArrayList<>();
+
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(dir)) {
+            for (Path entry : entries) {
                 try {
-                    scan(dir);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
+                    var attrs = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    if (attrs.isDirectory()) {
+                        subDirs.add(executor.submit(() -> scan(entry, maxFS, nb, executor)));   // fork
+                    } else if (attrs.isRegularFile()) {
+                        bands[FSReport.bandOf(attrs.size(), maxFS, nb)]++;
+                    }
+                } catch (IOException ex) {
+                    // unreadable entry: skipped
                 }
-                if (!isCompleted.getAndSet(true)) {
-                    listener.onComplete(globalStats.snapshot());
-                }
-            } finally {
-                executor.shutdown();
             }
-        });
-    }
-
-    private void scan(Path dir) throws Exception {
-        if (isCompleted.get()) return;
-
-        List<Future<FSStats>> futures;
-
-        // MAP — spawn one task per entry
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
-            futures = StreamSupport.stream(stream.spliterator(), false)
-                    .map(path -> executor.submit(() -> {
-                        if (isCompleted.get()) return new FSStats(nb);
-
-                        if (Files.isDirectory(path)) {
-                            scan(path);               // recurse (updates globalStats internally)
-                            return new FSStats(nb);   // subdir already merged itself
-                        } else {
-                            return processFile(path); // MAP: one partial result per file
-                        }
-                    }))
-                    .toList();
+        } catch (IOException | DirectoryIteratorException ex) {
+            // unreadable directory: it contributes only what was read so far
         }
 
-        // REDUCE — merge all file results for this directory
-        FSStats dirStats = new FSStats(nb);
-        for (Future<FSStats> future : futures) {
-            merge(dirStats, future.get());
+        FSReport report = FSReport.of(maxFS, bands);
+        for (Future<FSReport> subDir : subDirs) {            // join
+            try {
+                report = report.merge(subDir.get());
+            } catch (ExecutionException ex) {
+                throw ex.getCause() instanceof Exception cause ? cause : ex;
+            }
         }
-
-        // merge into global and notify UI once every UPDATE_INTERVAL_MS
-        merge(globalStats, dirStats);
-    }
-
-    private FSStats processFile(Path path) throws IOException {
-        FSStats partial = new FSStats(nb);
-        long size = Files.size(path);
-        int band = Math.min((int)(size / bandSize), nb);
-        partial.addFile(band);
-        return partial;
-    }
-
-    private void merge(FSStats dst, FSStats src) {
-        FSReport s = src.snapshot();
-        dst.mergeReport(s);
-    }
-
-    @Override
-    public void stop() {
-        if (!isCompleted.getAndSet(true)) {
-            executor.shutdownNow();
-        }
-    }
-
-    @Override
-    public FSReport getCurrentReport() {
-        return globalStats != null ? globalStats.snapshot() : new FSReport(0, new long[nb + 1]);
+        return report;
     }
 }
