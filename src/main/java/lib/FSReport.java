@@ -15,7 +15,7 @@ import java.util.Arrays;
 public record FSReport(long totalFiles, long maxFS, long[] bands) {
 
     public FSReport {
-        bands = bands.clone();                  // defensive copy: really immutable
+        bands = bands.clone();                  // defensive copy
     }
 
     @Override

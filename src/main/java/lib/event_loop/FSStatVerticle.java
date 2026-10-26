@@ -123,7 +123,7 @@ public class FSStatVerticle extends VerticleBase {
         return new FSReport(totalFiles, maxFS, bands);
     }
 
-    /* reports travel on the event bus as JSON (no custom codec needed) */
+    // reports travel on the event bus as JSON
     public static JsonObject toJson(FSReport r) {
         JsonArray b = new JsonArray();
         for (long v : r.bands()) {

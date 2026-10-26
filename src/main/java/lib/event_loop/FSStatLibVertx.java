@@ -23,11 +23,6 @@ import java.util.List;
  *  - reduce: Future.all(...) joins the children and their reports are merged.
  * Termination detection is therefore implicit: the future of a directory
  * completes exactly when the futures of all its entries have completed.
- *
- * Symbolic links are not followed (as in the other versions). Since Vert.x
- * readDir returns canonical paths (links already resolved), a link shows up
- * as a path that is not a direct child of the directory, or as a duplicate:
- * such entries are discarded, which also rules out cycles.
  */
 public class FSStatLibVertx {
 
@@ -74,12 +69,10 @@ public class FSStatLibVertx {
         return fs.lprops(path).compose(props -> {
             if (props.isDirectory()) {
                 return scanDir(path, empty);
-            } else if (props.isRegularFile()) {
-                return Future.succeededFuture(empty.addFile(props.size()));
             } else {
-                return Future.succeededFuture(empty);   // sockets, devices: ignored
+                return Future.succeededFuture(empty.addFile(props.size()));
             }
-        }).otherwise(empty);   // unreadable entry / sub-directory: it counts nothing
+        }).otherwise(empty);   // unreadable entry
     }
 
     static boolean isChildOf(String entry, String dir) {

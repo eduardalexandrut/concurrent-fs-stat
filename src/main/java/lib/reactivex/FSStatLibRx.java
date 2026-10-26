@@ -23,14 +23,14 @@ import java.util.List;
  *                        extension). The last item is the final report.
  *
  * Nothing is computed until someone subscribes; disposing the subscription
- * stops the scan (cancellation travels upstream through every operator).
+ * stops the scan.
  * The accumulation is done by reduce/scan: Rx serialises the items that
  * flatMap merges from different threads, so the accumulator is never
  * accessed concurrently and no shared mutable state is needed.
  */
 public class FSStatLibRx {
 
-    /* max sub-directories listed concurrently by each flatMap */
+    // max sub-directories listed concurrently by each flatMap
     private static final int MAX_CONCURRENCY = 8;
 
     public Single<FSReport> getFSReport(Path dir, long maxFS, int nb) {
@@ -43,7 +43,7 @@ public class FSStatLibRx {
                 .scan(FSReport.empty(maxFS, nb), FSReport::addFile));
     }
 
-    /* sizes of all the regular files under root (recursively) */
+    // sizes of all the regular files under root (recursively)
     private Flowable<Long> fileSizes(Path root) {
         return Flowable.defer(() -> Files.isDirectory(root)
                 ? sizesIn(root)

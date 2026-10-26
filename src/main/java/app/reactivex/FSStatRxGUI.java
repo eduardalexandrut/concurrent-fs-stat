@@ -41,7 +41,8 @@ class RxController implements ViewListener {
     @Override
     public void startRequested(Path dir, long maxFS, int nb) {
         FSReport[] last = { FSReport.empty(maxFS, nb) };   // touched only by the (serialised) subscriber callbacks
-        subscription = lib.getFSReportStream(dir, maxFS, nb)
+        subscription = lib
+                .getFSReportStream(dir, maxFS, nb)
                 .sample(UPDATE_PERIOD_MS, TimeUnit.MILLISECONDS, true)
                 .subscribe(
                         report -> {
